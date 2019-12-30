@@ -442,6 +442,9 @@ func gen(out *bufio.Writer, x *rule) {
 			newNilEdge(end, nend)
 			end = nend
 		case '?':
+			nstart := newNode()
+			newNilEdge(nstart, start)
+			start = nstart
 			newNilEdge(start, end)
 		default:
 			return
@@ -517,20 +520,20 @@ func gen(out *bufio.Writer, x *rule) {
 
 	// NFA -> DFA
 	nilClose := func(st []bool) {
-		mark := make([]bool, n)
+		visited := make([]bool, n)
 		var do func(int)
 		do = func(i int) {
+			visited[i] = true
 			v := short[i]
 			for _, e := range v.e {
-				if e.kind == kNil && !mark[e.dst.n] {
+				if e.kind == kNil && !visited[e.dst.n] {
 					st[e.dst.n] = true
 					do(e.dst.n)
 				}
 			}
 		}
 		for i := 0; i < n; i++ {
-			if st[i] && !mark[i] {
-				mark[i] = true
+			if st[i] && !visited[i] {
 				do(i)
 			}
 		}
@@ -772,14 +775,15 @@ type frame struct {
 }
 type Lexer struct {
   // The lexer runs in its own goroutine, and communicates via channel 'ch'.
-  ch chan frame
-  ch_stop chan bool
   // We record the level of nesting because the action could return, and a
   // subsequent call expects to pick up where it left off. In other words,
   // we're simulating a coroutine.
   // TODO: Support a channel-based variant that compatible with Go's yacc.
   stack []frame
   stale bool
+
+  frames []frame
+  frameIndex int
 
   // The 'l' and 'c' fields were added for
   // https://github.com/wagerlabs/docker/blob/65694e801a7b80930961d70c69cba9f2465459be/buildfile.nex
@@ -800,10 +804,22 @@ func NewLexerWithInit(in io.Reader, initFun func(*Lexer)) *Lexer {
   if initFun != nil {
     initFun(yylex)
   }
-  yylex.ch = make(chan frame)
-  yylex.ch_stop = make(chan bool, 1)
-  var scan func(in *bufio.Reader, ch chan frame, ch_stop chan bool, family []dfa, line, column int) 
-  scan = func(in *bufio.Reader, ch chan frame, ch_stop chan bool, family []dfa, line, column int) {
+  yylex.Scan(bufio.NewReader(in), dfas, 0, 0)
+  return yylex
+}
+
+// NextFrame ...
+func (yylex *Lexer) NextFrame() frame {
+	if yylex.frameIndex < len(yylex.frames) {
+		frame := yylex.frames[yylex.frameIndex]
+		yylex.frameIndex++
+		return frame
+	}
+
+	return frame{-1, "", -1, -1}
+}
+
+func (yylex *Lexer) Scan(in *bufio.Reader, family []dfa, line, column int) {
     // Index of DFA and length of highest-precedence match so far.
     matchi, matchn := 0, -1
     var buf []rune
@@ -832,7 +848,6 @@ func NewLexerWithInit(in io.Reader, initFun func(*Lexer)) *Lexer {
       }
     }
     atEOF := false
-    stopped := false
     for {
       if n == len(buf) && !atEOF {
         r,_,err := in.ReadRune()
@@ -890,27 +905,9 @@ dollar:  // Handle $.
           text := string(buf[:matchn])
           buf = buf[matchn:]
           matchn = -1
-          for {
-            sent := false
-            select {
-              case ch <- frame{matchi, text, line, column}: {
-                sent = true
-              }
-              case stopped = <- ch_stop: {
-              }
-              default: {
-                // nothing
-              }
-            }
-            if stopped||sent {
-              break
-            }
-          }
-          if stopped {
-            break
-          }
+          yylex.frames = append(yylex.frames, frame{matchi, text, line, column})
           if len(family[matchi].nest) > 0 {
-            scan(bufio.NewReader(strings.NewReader(text)), ch, ch_stop, family[matchi].nest, line, column)
+            yylex.Scan(bufio.NewReader(strings.NewReader(text)), family[matchi].nest, line, column)
           }
           if atEOF {
             break
@@ -925,10 +922,7 @@ dollar:  // Handle $.
         }
       }
     }
-    ch <- frame{-1, "", line, column}
-  }
-  go scan(bufio.NewReader(in), yylex.ch, yylex.ch_stop, dfas, 0, 0)
-  return yylex
+    yylex.frames = append(yylex.frames, frame{-1, "", line, column})
 }
 
 type dfa struct {
@@ -947,7 +941,6 @@ func NewLexer(in io.Reader) *Lexer {
 }
 
 func (yyLex *Lexer) Stop() {
-  yyLex.ch_stop <- true
 }
 
 // Text returns the matched text.
@@ -983,7 +976,7 @@ func (yylex *Lexer) next(lvl int) int {
   }
   if lvl == len(yylex.stack) - 1 {
     p := &yylex.stack[lvl]
-    *p = <-yylex.ch
+    *p = yylex.NextFrame()
     yylex.stale = false
   } else {
     yylex.stale = true
